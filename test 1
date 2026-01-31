@@ -1,0 +1,678 @@
+import os, glob, json, math, argparse
+import numpy as np
+import cv2
+from tqdm import tqdm
+
+LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+DIGITS  = "0123456789"
+VALID_CHARS = LETTERS + DIGITS
+
+# =========================
+# Utils
+# =========================
+def norm_text(s: str) -> str:
+    s = (s or "").upper()
+    s = "".join([c for c in s if c in VALID_CHARS])
+    return s
+
+def read_label_from_annotations(track_dir: str) -> str:
+    ann = os.path.join(track_dir, "annotations.json")
+    if not os.path.exists(ann):
+        return ""
+    try:
+        data = json.load(open(ann, "r", encoding="utf-8"))
+    except:
+        return ""
+
+    if isinstance(data, dict):
+        for k in ["plate_text", "plate", "license_plate", "text", "gt", "label", "lp"]:
+            if k in data and isinstance(data[k], str):
+                return norm_text(data[k])
+    return ""
+
+def imread_gray(path: str):
+    return cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+
+def ensure_size(gray, target_h=64, target_w=256):
+    return cv2.resize(gray, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+
+def lap_var(gray):
+    return float(cv2.Laplacian(gray, cv2.CV_32F).var())
+
+def softmax(logits):
+    m = np.max(logits)
+    ex = np.exp(logits - m)
+    return ex / (np.sum(ex) + 1e-9)
+
+def fix_confusions(ch: str, pos: int, expected_len: int = 7) -> str:
+    """
+    Ép nhầm lẫn chữ/số theo vị trí (giảm O/0, I/1, B/8, S/5, Z/2).
+    Brazil: 7 ký tự, pos 0-2 là chữ, pos 3-6 là số.
+    """
+    if not ch:
+        return ch
+    ch = ch.upper()
+
+    if expected_len == 7:
+        if pos < 3:
+            return {"0": "O", "1": "I", "8": "B", "5": "S", "2": "Z"}.get(ch, ch)
+        else:
+            return {"O": "0", "I": "1", "B": "8", "S": "5", "Z": "2"}.get(ch, ch)
+    return ch
+
+def clahe_gray(gray):
+    return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+
+def binarize(gray):
+    """
+    Output: text=255, background=0 (trắng chữ, nền đen)
+    """
+    g = clahe_gray(gray)
+    g = cv2.GaussianBlur(g, (3, 3), 0)
+    _, th = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # nếu nền sáng => đảo để chữ trắng nền đen
+    if np.mean(th) > 127:
+        th = 255 - th
+
+    # giảm viền khung / hạt
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, k, iterations=1)
+    return th
+
+def find_text_band(bin_img):
+    """
+    Tìm dải ngang chứa chữ dựa trên mật độ pixel trắng.
+    """
+    H, W = bin_img.shape
+    white = (bin_img == 255).astype(np.uint8)
+    row = white.sum(axis=1).astype(np.float32) / (W + 1e-6)
+    thr = max(0.02, float(row.mean() + row.std() * 0.5))
+    idx = np.where(row > thr)[0]
+    if len(idx) < 5:
+        return 0, H
+    y0, y1 = int(idx[0]), int(idx[-1])
+    pad = int(0.08 * H)
+    y0 = max(0, y0 - pad)
+    y1 = min(H, y1 + pad)
+    return y0, y1
+
+def crop_tight_y(bin_roi):
+    rows = np.where((bin_roi == 255).sum(axis=1) > 0)[0]
+    if len(rows) == 0:
+        return bin_roi
+    return bin_roi[rows[0] : rows[-1] + 1, :]
+
+def normalize_char(bin_roi, out_h=32, out_w=20):
+    """
+    bin_roi: chữ trắng nền đen (255/0)
+    Return float32 (out_h,out_w) in [0,1], chữ=1.
+    """
+    roi = crop_tight_y(bin_roi)
+    x = (roi.astype(np.float32) / 255.0)
+    h, w = x.shape
+    if h <= 0 or w <= 0:
+        return None
+
+    scale = out_h / max(1, h)
+    nw = int(w * scale)
+    x2 = cv2.resize(x, (max(1, nw), out_h), interpolation=cv2.INTER_CUBIC)
+
+    if x2.shape[1] < out_w:
+        pad = out_w - x2.shape[1]
+        left = pad // 2
+        right = pad - left
+        x2 = np.pad(x2, ((0, 0), (left, right)), constant_values=0.0)
+    else:
+        s = (x2.shape[1] - out_w) // 2
+        x2 = x2[:, s : s + out_w]
+
+    return x2
+
+# =========================
+# Segmentation: focus "ink" (vùng chữ)
+# =========================
+def _connected_component_boxes(th_crop):
+    """
+    th_crop: chữ trắng nền đen.
+    Return list of (x0,x1) boxes theo trục X (đã lọc nhiễu).
+    """
+    H, W = th_crop.shape
+    mask = (th_crop == 255).astype(np.uint8)
+
+    # connected components
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    boxes = []
+    for i in range(1, num):
+        x, y, w, h, area = stats[i]
+        if area < 25:
+            continue
+        if h < 0.25 * H:
+            continue
+        if w < 2:
+            continue
+        if w > 0.45 * W:
+            continue
+        boxes.append((x, x + w))
+
+    boxes.sort(key=lambda t: t[0])
+
+    # merge boxes nếu quá sát nhau (dính nét)
+    merged = []
+    for a, b in boxes:
+        if not merged:
+            merged.append([a, b])
+        else:
+            if a - merged[-1][1] <= 2:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+    return [(int(x0), int(x1)) for x0, x1 in merged]
+
+def _dp_cuts_by_ink(th_crop, expected_len, min_char_w=10):
+    """
+    Tìm expected_len segment theo 'khe' có ink thấp nhất bằng DP.
+    th_crop: chữ trắng nền đen.
+    Return segs: list[(x0,x1)] length=expected_len hoặc None.
+    """
+    H, W = th_crop.shape
+    ink = (th_crop == 255).astype(np.uint8).sum(axis=0).astype(np.float32)  # (W,)
+    # smooth
+    k = 9
+    ink_s = np.convolve(ink, np.ones(k) / k, mode="same")
+
+    # cost cắt tại x: ink càng thấp càng tốt
+    cost = ink_s.copy()
+
+    # candidate cut positions: lấy những chỗ ink thấp (valley)
+    # nhưng để đơn giản+ổn: DP trên mọi x với ràng buộc khoảng cách
+    K = expected_len
+    if K < 2 or W < K * min_char_w:
+        return None
+
+    # DP[j][x] = min cost chọn j cuts đến vị trí x
+    # cuts count = K-1
+    cuts_needed = K - 1
+    INF = 1e18
+    dp = np.full((cuts_needed + 1, W), INF, dtype=np.float64)
+    prev = np.full((cuts_needed + 1, W), -1, dtype=np.int32)
+
+    # không cắt (j=0): cost = 0 ở mọi x (nhưng x sẽ là cut position)
+    dp[0, :] = 0.0
+
+    # ràng buộc cut không gần biên và khoảng cách min_char_w
+    valid_x = np.arange(W, dtype=np.int32)
+    valid_x = valid_x[(valid_x >= min_char_w) & (valid_x <= W - min_char_w)]
+
+    for j in range(1, cuts_needed + 1):
+        for x in valid_x:
+            # previous cut p phải <= x - min_char_w
+            pmax = x - min_char_w
+            if pmax < min_char_w:
+                continue
+            # scan p trong [min_char_w, pmax]
+            # để chạy nhanh hơn: chỉ scan step=1 vì W=256 nhỏ
+            best_v = INF
+            best_p = -1
+            for p in range(min_char_w, pmax + 1):
+                v = dp[j - 1, p] + cost[x]
+                if v < best_v:
+                    best_v = v
+                    best_p = p
+            dp[j, x] = best_v
+            prev[j, x] = best_p
+
+    # chọn last cut x sao cho vẫn đủ chỗ cho ký tự cuối
+    best_last = -1
+    best_v = INF
+    for x in valid_x:
+        if x > W - min_char_w:
+            continue
+        v = dp[cuts_needed, x]
+        if v < best_v:
+            best_v = v
+            best_last = x
+
+    if best_last < 0:
+        return None
+
+    # backtrack cuts
+    cuts = []
+    x = best_last
+    for j in range(cuts_needed, 0, -1):
+        cuts.append(int(x))
+        x = int(prev[j, x])
+        if x < 0:
+            return None
+    cuts = sorted(cuts)
+
+    # build segments
+    xs = [0] + cuts + [W]
+    segs = []
+    for i in range(len(xs) - 1):
+        a, b = xs[i], xs[i + 1]
+        if b - a < min_char_w:
+            return None
+        segs.append((a, b))
+    if len(segs) != expected_len:
+        return None
+    return segs
+
+def plate_to_chars(gray_plate, expected_len=7, debug_dir=None, tag=""):
+    """
+    Cắt ký tự theo 'vùng ink' (connected components + DP cut).
+    """
+    gray = ensure_size(gray_plate, target_h=64, target_w=256)
+    th = binarize(gray)
+
+    y0, y1 = find_text_band(th)
+    th_crop = th[y0:y1, :]
+
+    # cố gắng giảm "khung" trên/dưới (hay dính thành vệt dài)
+    Hc, Wc = th_crop.shape
+    # remove horizontal thick lines (morph open theo ngang)
+    k_h = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+    hor = cv2.morphologyEx(th_crop, cv2.MORPH_OPEN, k_h, iterations=1)
+    th_ink = cv2.subtract(th_crop, hor)
+
+    # 1) boxes từ connected components
+    boxes = _connected_component_boxes(th_ink)
+
+    # convert boxes->segs
+    segs = boxes
+
+    # 2) nếu lệch expected_len, dùng DP cut theo ink profile
+    if expected_len is not None and expected_len >= 4:
+        if len(segs) != expected_len:
+            dp_segs = _dp_cuts_by_ink(th_ink, expected_len=expected_len, min_char_w=10)
+            if dp_segs is not None:
+                segs = dp_segs
+            else:
+                # fallback cuối cùng (chỉ khi DP fail)
+                step = Wc / expected_len
+                segs = [(int(i * step), int((i + 1) * step)) for i in range(expected_len)]
+
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(debug_dir, f"{tag}_plate_gray.png"), gray)
+        cv2.imwrite(os.path.join(debug_dir, f"{tag}_plate_bin.png"), th)
+        cv2.imwrite(os.path.join(debug_dir, f"{tag}_band_bin.png"), th_crop)
+        cv2.imwrite(os.path.join(debug_dir, f"{tag}_ink_bin.png"), th_ink)
+
+        vis = cv2.cvtColor(gray[y0:y1, :], cv2.COLOR_GRAY2BGR)
+        for (a, b) in segs:
+            cv2.rectangle(vis, (a, 0), (b, vis.shape[0] - 1), (0, 255, 0), 2)
+        cv2.imwrite(os.path.join(debug_dir, f"{tag}_segs.png"), vis)
+
+    chars_bin = []
+    for i, (a, b) in enumerate(segs):
+        roi = th_ink[:, a:b]
+        roi = crop_tight_y(roi)
+        chars_bin.append(roi)
+        if debug_dir:
+            cv2.imwrite(os.path.join(debug_dir, f"{tag}_charbin_{i:02d}.png"), roi)
+    return chars_bin
+
+# =========================
+# ECC align + fuse
+# =========================
+def fuse_frames(frames, use_ecc=False, fuse_mode="mean"):
+    frames = [f for f in frames if f is not None]
+    if len(frames) == 0:
+        return None
+
+    fixed = []
+    for f in frames:
+        if len(f.shape) == 3:
+            f = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        if f.dtype != np.uint8:
+            f = np.clip(f, 0, 255).astype(np.uint8)
+        fixed.append(f)
+
+    min_h = min(im.shape[0] for im in fixed)
+    min_w = min(im.shape[1] for im in fixed)
+    fixed = [cv2.resize(im, (min_w, min_h), interpolation=cv2.INTER_AREA) for im in fixed]
+
+    if use_ecc and len(fixed) >= 2:
+        ref = fixed[0]
+        ref_f = ref.astype(np.float32) / 255.0
+        aligned = [ref]
+
+        for im in fixed[1:]:
+            try:
+                mov = im.astype(np.float32) / 255.0
+                warp = np.eye(2, 3, dtype=np.float32)
+                criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-4)
+                _, warp = cv2.findTransformECC(ref_f, mov, warp, cv2.MOTION_TRANSLATION, criteria)
+                im_w = cv2.warpAffine(im, warp, (min_w, min_h),
+                                      flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+                                      borderMode=cv2.BORDER_REPLICATE)
+                aligned.append(im_w)
+            except:
+                aligned.append(im)
+        fixed = aligned
+
+    stack = np.stack(fixed, axis=0).astype(np.float32)
+    fused = np.median(stack, axis=0) if fuse_mode == "median" else np.mean(stack, axis=0)
+    return np.clip(fused, 0, 255).astype(np.uint8)
+
+# =========================
+# CharMemory (Gaussian pixel model)
+# =========================
+class CharMemory:
+    def __init__(self, out_h=32, out_w=20):
+        self.out_h = out_h
+        self.out_w = out_w
+        self.samples = {c: [] for c in VALID_CHARS}
+        self.mu = {}
+        self.var = {}
+        self.count = {}
+
+    def add(self, ch, img_norm):
+        if ch not in self.samples:
+            return
+        self.samples[ch].append(img_norm)
+
+    def finalize(self):
+        eps = 1e-3
+        for ch, lst in self.samples.items():
+            if len(lst) == 0:
+                continue
+            X = np.stack(lst, axis=0)
+            self.mu[ch] = np.mean(X, axis=0)
+            self.var[ch] = np.var(X, axis=0) + eps
+            self.count[ch] = len(lst)
+
+    def save(self, path):
+        keys = sorted(list(self.mu.keys()))
+        np.savez_compressed(
+            path,
+            keys=np.array(keys),
+            mu=np.stack([self.mu[k] for k in keys], axis=0),
+            var=np.stack([self.var[k] for k in keys], axis=0),
+            count=np.array([self.count[k] for k in keys], dtype=np.int32),
+            out_h=np.int32(self.out_h),
+            out_w=np.int32(self.out_w),
+        )
+
+    @staticmethod
+    def load(path):
+        z = np.load(path, allow_pickle=True)
+        keys = [str(k) for k in z["keys"].tolist()]
+        out_h = int(z["out_h"])
+        out_w = int(z["out_w"])
+        mem = CharMemory(out_h, out_w)
+        mu = z["mu"]
+        var = z["var"]
+        cnt = z["count"]
+        for i, k in enumerate(keys):
+            mem.mu[k] = mu[i]
+            mem.var[k] = var[i]
+            mem.count[k] = int(cnt[i])
+        return mem
+
+    def _score_keys(self, img_norm, keys):
+        x = img_norm
+        logits = []
+        for k in keys:
+            mu = self.mu[k]
+            var = self.var[k]
+            ll = -0.5 * np.sum(np.log(var)) - 0.5 * np.sum(((x - mu) ** 2) / var)
+            ll += 0.05 * math.log(self.count.get(k, 1) + 1)
+            logits.append(ll)
+        logits = np.array(logits, dtype=np.float64)
+        prob = softmax(logits)
+        j = int(np.argmax(prob))
+        top = [(keys[i], float(prob[i])) for i in np.argsort(-prob)[:5]]
+        return keys[j], float(prob[j]), top
+
+    def predict_one(self, img_norm):
+        keys = list(self.mu.keys())
+        if len(keys) == 0:
+            return "", 0.0, []
+        return self._score_keys(img_norm, keys)
+
+    def predict_one_restricted(self, img_norm, allowed_chars: str):
+        keys = [k for k in self.mu.keys() if k in allowed_chars]
+        if len(keys) == 0:
+            return "", 0.0, []
+        return self._score_keys(img_norm, keys)
+
+# =========================
+# Build memory
+# =========================
+def build_memory(train_root, out_model, max_tracks=None, debug_n=3, expected_len=7):
+    mem = CharMemory(out_h=32, out_w=20)
+
+    tracks = sorted([d for d in os.listdir(train_root) if d.startswith("track_")])
+    if max_tracks and max_tracks > 0:
+        tracks = tracks[:max_tracks]
+
+    used = 0
+    skipped = 0
+
+    for idx, tid in enumerate(tqdm(tracks, desc="BuildMem")):
+        tdir = os.path.join(train_root, tid)
+        label = read_label_from_annotations(tdir)
+        if len(label) < 4:
+            skipped += 1
+            continue
+
+        hr_imgs = sorted(glob.glob(os.path.join(tdir, "hr-*.*")))
+        lr_imgs = sorted(glob.glob(os.path.join(tdir, "lr-*.*")))
+        if len(hr_imgs) == 0:
+            skipped += 1
+            continue
+
+        # chọn HR sắc nhất để học
+        hr_grays = [(p, imread_gray(p)) for p in hr_imgs]
+        hr_grays = [(p, g) for p, g in hr_grays if g is not None]
+        if len(hr_grays) == 0:
+            skipped += 1
+            continue
+        hr_grays.sort(key=lambda t: lap_var(t[1]), reverse=True)
+        hr = hr_grays[0][1]
+
+        dbg = os.path.join(tdir, "_memdbg") if idx < debug_n else None
+        exp = expected_len if expected_len is not None else len(label)
+
+        char_bins_hr = plate_to_chars(hr, expected_len=exp, debug_dir=dbg, tag="HR")
+
+        if len(char_bins_hr) != len(label):
+            skipped += 1
+            continue
+
+        ok = True
+        for ch, roi in zip(label, char_bins_hr):
+            x = normalize_char(roi, 32, 20)
+            if x is None:
+                ok = False
+                break
+            mem.add(ch, x)
+        if not ok:
+            skipped += 1
+            continue
+
+        # add LR samples (lấy LR-001 nếu có)
+        if len(lr_imgs) > 0:
+            lr = imread_gray(lr_imgs[0])
+            if lr is not None:
+                char_bins_lr = plate_to_chars(lr, expected_len=exp, debug_dir=dbg, tag="LR")
+                if len(char_bins_lr) == len(label):
+                    for ch, roi in zip(label, char_bins_lr):
+                        x = normalize_char(roi, 32, 20)
+                        if x is not None:
+                            mem.add(ch, x)
+
+        used += 1
+
+    mem.finalize()
+
+    if len(mem.mu) == 0:
+        print("❌ mem.mu rỗng -> label/cắt ký tự đang sai.")
+        return
+
+    mem.save(out_model)
+
+    print("Saved model:", out_model)
+    print("Used tracks:", used, "Skipped:", skipped)
+    for c in VALID_CHARS:
+        n = len(mem.samples.get(c, []))
+        if n > 0:
+            print(c, n)
+
+# =========================
+# Predict one
+# =========================
+def predict_plate(mem: CharMemory, gray_plate, expected_len=7, debug_dir=None, tag="PRED"):
+    char_bins = plate_to_chars(gray_plate, expected_len=expected_len, debug_dir=debug_dir, tag=tag)
+
+    chars, probs, tops = [], [], []
+    for i, roi in enumerate(char_bins):
+        x = normalize_char(roi, mem.out_h, mem.out_w)
+        if x is None:
+            chars.append("")
+            probs.append(0.0)
+            tops.append([])
+            continue
+
+        if expected_len == 7:
+            allowed = LETTERS if i < 3 else DIGITS
+        else:
+            allowed = VALID_CHARS
+
+        ch, p, top = mem.predict_one_restricted(x, allowed)
+        ch = fix_confusions(ch, i, expected_len)
+
+        chars.append(ch)
+        probs.append(p)
+        tops.append(top)
+
+    plate = "".join([c for c in chars if c])
+    conf = float(np.mean(probs)) if len(probs) else 0.0
+    return plate, conf, chars, probs, tops
+
+# =========================
+# Track image listing + predict_tracks
+# =========================
+def list_track_lr_images(track_dir):
+    lr = sorted(glob.glob(os.path.join(track_dir, "lr-*.*")))
+    if len(lr) > 0:
+        return lr
+    imgs = sorted([p for p in glob.glob(os.path.join(track_dir, "*.*"))
+                   if p.lower().endswith((".png",".jpg",".jpeg"))])
+    imgs = [p for p in imgs if ("hr-" not in os.path.basename(p).lower())]
+    return imgs
+
+def run_predict_tracks(mem_path, test_root, out_txt, debug_first_n=1, expected_len=7, use_ecc=True, fuse_mode="mean"):
+    mem = CharMemory.load(mem_path)
+    tracks = sorted([d for d in os.listdir(test_root) if d.startswith("track_")])
+    lines = []
+
+    for i, tid in enumerate(tqdm(tracks, desc="Predict")):
+        tdir = os.path.join(test_root, tid)
+        imgs = list_track_lr_images(tdir)[:5]
+
+        frames = []
+        for p in imgs:
+            g = imread_gray(p)
+            if g is not None:
+                frames.append(g)
+
+        if len(frames) == 0:
+            lines.append(f"{tid},UNKNOWN;0.0000")
+            continue
+
+        fused = fuse_frames(frames, use_ecc=use_ecc, fuse_mode=fuse_mode)
+        if fused is None:
+            lines.append(f"{tid},UNKNOWN;0.0000")
+            continue
+
+        dbg = os.path.join(tdir, "_pred_dbg") if i < debug_first_n else None
+        plate, conf, chars, probs, tops = predict_plate(mem, fused, expected_len=expected_len, debug_dir=dbg, tag="FUSED")
+
+        plate = norm_text(plate)
+        if expected_len is not None and len(plate) != expected_len:
+            plate, conf = "UNKNOWN", 0.0
+        if len(plate) < 4:
+            plate, conf = "UNKNOWN", 0.0
+
+        lines.append(f"{tid},{plate};{conf:.4f}")
+
+        if dbg:
+            os.makedirs(dbg, exist_ok=True)
+            cv2.imwrite(os.path.join(dbg, "fused.png"), fused)
+            print("\nTrack", tid, "=>", plate, conf)
+            for k in range(len(chars)):
+                print("  pos", k, "pred", chars[k], "p", probs[k], "top", tops[k])
+
+    with open(out_txt, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print("Saved:", out_txt)
+
+# =========================
+# main
+# =========================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["build", "peek", "predict_one", "predict_tracks"], required=True)
+    ap.add_argument("--train_root", default=r"D:\LRLPR\data\train")
+    ap.add_argument("--test_root", default=r"D:\LRLPR\data\test_public")
+    ap.add_argument("--model_out", default=r"D:\LRLPR\char_memory_model.npz")
+    ap.add_argument("--model_in", default=r"D:\LRLPR\char_memory_model.npz")
+    ap.add_argument("--out_txt", default=r"D:\LRLPR\predictions_char_memory.txt")
+    ap.add_argument("--img", default="")
+    ap.add_argument("--max_tracks", type=int, default=0)     # 0 = dùng tất cả
+    ap.add_argument("--expected_len", type=int, default=7)   # ICPR Brazil thường 7
+    ap.add_argument("--no_ecc", action="store_true")         # tắt ECC align
+    ap.add_argument("--fuse_mode", choices=["mean", "median"], default="mean")
+    args = ap.parse_args()
+
+    if args.mode == "peek":
+        tracks = sorted([d for d in os.listdir(args.train_root) if d.startswith("track_")])[:10]
+        for tid in tracks:
+            tdir = os.path.join(args.train_root, tid)
+            lb = read_label_from_annotations(tdir)
+            print(tid, "=>", lb)
+        return
+
+    exp = args.expected_len if (args.expected_len is not None and args.expected_len > 0) else None
+
+    if args.mode == "build":
+        mx = args.max_tracks if args.max_tracks > 0 else None
+        build_memory(args.train_root, args.model_out, max_tracks=mx, debug_n=3, expected_len=exp)
+
+    elif args.mode == "predict_one":
+        mem = CharMemory.load(args.model_in)
+        if not args.img:
+            raise RuntimeError("Thiếu --img")
+
+        g = imread_gray(args.img)
+        if g is None:
+            raise RuntimeError("Không đọc được ảnh: " + args.img)
+
+        dbg = os.path.join(os.path.dirname(args.img), "_one_dbg")
+        plate, conf, chars, probs, tops = predict_plate(mem, g, expected_len=exp, debug_dir=dbg, tag="ONE")
+
+        plate = norm_text(plate)
+        if exp is not None and len(plate) != exp:
+            plate, conf = "UNKNOWN", 0.0
+
+        print("PLATE:", plate, "CONF:", conf)
+        for i in range(len(chars)):
+            print(" pos", i, "pred", chars[i], "p", probs[i], "top", tops[i])
+
+    elif args.mode == "predict_tracks":
+        run_predict_tracks(
+            args.model_in,
+            args.test_root,
+            args.out_txt,
+            debug_first_n=1,
+            expected_len=exp,
+            use_ecc=(not args.no_ecc),
+            fuse_mode=args.fuse_mode,
+        )
+
+if __name__ == "__main__":
+    main()
+
